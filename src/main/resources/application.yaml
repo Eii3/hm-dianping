@@ -1,0 +1,23 @@
+server:
+  port: 8081
+spring:
+  application:
+    name: hmdp
+  datasource:
+    driver-class-name: com.mysql.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/hmdp?useSSL=false&serverTimezone=UTC
+    username: root
+    password: "0092"
+  redis:
+    host: 192.168.165.131
+    port: 6379
+    password: 123456
+    database: 0 #redis启动后有16个数据库 我们使用0号数据库
+
+  jackson:
+    default-property-inclusion: non_null # JSON处理时忽略非空字段
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity # 别名扫描包
+logging:
+  level:
+    com.hmdp: debug
