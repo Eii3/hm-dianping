@@ -54,4 +54,19 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         // 5.返回商铺信息
         return Result.ok(shop);
     }
+
+    @Override
+    public Result update(Shop shop) {
+        // 1.检验id
+        Long id = shop.getId();
+        if(id == null){
+            return Result.fail("商铺id不能为空");
+        }
+        // 2.更新数据库
+        updateById(shop);
+
+        // 3.删除缓存
+        stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+        return Result.ok();
+    }
 }
