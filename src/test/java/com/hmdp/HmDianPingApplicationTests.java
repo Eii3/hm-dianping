@@ -14,7 +14,7 @@ class HmDianPingApplicationTests {
     private ShopServiceImpl shopService;
 
     @Test
-    public void testSaveShopToRedis(){
+    public void testSaveShopToRedis() throws InterruptedException {
         shopService.saveShopToRedis(1L,10L);
 
     }
