@@ -7,8 +7,10 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -29,6 +31,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private SeckillVoucherServiceImpl seckillVoucherService;
     @Resource
     private RedisIdWorker redisIdWorker;
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
 
     @Override
     public Result seckillVoucher(Long voucherID) {
@@ -49,11 +53,32 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         Long userID = UserHolder.getUser().getId();
-        synchronized (userID.toString().intern()) {
+
+        SimpleRedisLock lock = new SimpleRedisLock("order:" + userID, stringRedisTemplate);
+
+        // 获取锁
+        boolean tryLock = lock.tryLock(1200);
+        if(!tryLock){
+            // 获取失败
+            return Result.fail("不允许重复下单");
+        }
+
+        // 获取成功
+        try{
             // @transactional是利用spring的代理对象实现的，如果直接用this调用目标对象无法实现事务，所以要获取代理对象
             IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
             return proxy.createVoucherOrder(voucherID, userID);
+        }finally {
+            // 释放锁 （这段代码可能会遇到异常 但无论是否异常 锁都应该被释放）
+            lock.unlock();
         }
+
+
+        // 这个办法如果有两个进程则会有两把锁 那么就不能实现一人一单
+        /*synchronized (userID.toString().intern()) {
+            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+            return proxy.createVoucherOrder(voucherID, userID);
+        }*/
     }
 
     @Transactional
