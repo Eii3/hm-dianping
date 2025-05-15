@@ -64,6 +64,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         // 获取成功
+        // 这两个线程同步时没有关系的，因为这两个线程是同一个user_id的
+        // 所以，在createVoucherOrder这个方法中已经实现了一个用户只能创建一个订单的方法
         try{
             // @transactional是利用spring的代理对象实现的，如果直接用this调用目标对象无法实现事务，所以要获取代理对象
             IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
