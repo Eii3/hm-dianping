@@ -7,17 +7,18 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
-import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
-import org.springframework.aop.framework.AopContext;
+import cn.hutool.json.JSONUtil;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
-import java.time.LocalDateTime;
+import java.util.Collections;
 
 /**
  * <p>
@@ -29,6 +30,7 @@ import java.time.LocalDateTime;
  */
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+    private static final String ORDER_TOPIC = "voucher-order-topic";
     @Resource
     private SeckillVoucherServiceImpl seckillVoucherService;
     @Resource
@@ -37,56 +39,66 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private StringRedisTemplate stringRedisTemplate;
 
     @Resource
-    private RedissonClient redissonClient;
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    // Lua脚本
+    private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    static {
+        SECKILL_SCRIPT = new DefaultRedisScript<>();
+        SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
+        SECKILL_SCRIPT.setResultType(Long.class);
+    }
+
+    // 完成库存扣减和订单生成
+    @KafkaListener(topics = ORDER_TOPIC, groupId = "voucher-order-group")
+    @Transactional
+    public void handleVoucherOrder(String msg) {
+        VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
+        // 在Redis已经做了库存是否充足和一人一单的校验,能够到这里说明用户已经秒杀成功了,所以这里其实不需要加锁
+        // 1.扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock -1")
+                .eq("voucher_id", voucherOrder.getVoucherId())
+                .gt("stock", 0)
+                .update();
+        if(!success){
+            // 扣减库存失败
+            log.error("库存不足");
+            return;
+        }
+        // 2.创建订单
+        save(voucherOrder);
+    }
 
     @Override
     public Result seckillVoucher(Long voucherID) {
-        // 1.查询优惠券
-        SeckillVoucher voucher = seckillVoucherService.getById(voucherID);
-
-        // 2.判断是否开始/结束
-        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
-            return Result.fail("秒杀未开始");
-        }
-        if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
-            return Result.fail("秒杀已结束");
-        }
-
-        // 3.判断库存是否充足
-        if (voucher.getStock() < 1) {
-            return Result.fail("库存不足");
-        }
-
         Long userID = UserHolder.getUser().getId();
 
-        // 获取锁
-        String key = "order" +userID;
-        RLock lock = redissonClient.getLock(key);
-        boolean isLock = lock.tryLock();
-        if(!isLock){
-            // 获取失败,此时是同一个用户并发多个请求,应该返回错误
-            return Result.fail("不允许重复下单");
+        // 1.执行lua脚本,判断是否有资格下单
+        Long result = stringRedisTemplate.execute(
+                SECKILL_SCRIPT,
+                Collections.emptyList(),
+                voucherID.toString(),
+                userID.toString()
+        );
+        if(result == 1){
+            return Result.fail("库存不足");
         }
-
-        // 获取成功
-        // 这两个线程同步时没有关系的，因为这两个线程是同一个user_id的
-        // 所以，在createVoucherOrder这个方法中已经实现了一个用户只能创建一个订单的方法
-        try{
-            // @transactional是利用spring的代理对象实现的，如果直接用this调用目标对象无法实现事务，所以要获取代理对象
-            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
-            return proxy.createVoucherOrder(voucherID, userID);
-        }finally {
-            // 释放锁 （这段代码可能会遇到异常 但无论是否异常 锁都应该被释放）
-            lock.unlock();
+        if(result == 2){
+            return Result.fail("重复下单");
         }
-
-
-        // 这个办法如果有两个进程则会有两把锁 那么就不能实现一人一单
-        /*synchronized (userID.toString().intern()) {
-            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
-            return proxy.createVoucherOrder(voucherID, userID);
-        }*/
+        // 有购买资格
+        long orderID = redisIdWorker.nextID("order");
+        // 2.保存信息到阻塞队列,会有一个线程不断从当中取出信息,执行扣库存和生成订单
+        VoucherOrder voucherOrder = new VoucherOrder();
+        voucherOrder.setId(orderID);    // 订单ID
+        voucherOrder.setUserId(userID); // 用户ID
+        voucherOrder.setVoucherId(voucherID); // 优惠券ID
+        kafkaTemplate.send(ORDER_TOPIC, JSONUtil.toJsonStr(voucherOrder));
+        return Result.ok(orderID);
     }
+
+
 
     @Transactional
     public Result createVoucherOrder(Long voucherID, Long userID) {
