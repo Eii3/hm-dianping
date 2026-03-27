@@ -7,25 +7,18 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.RedisIdWorker;
-import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
-import org.springframework.aop.framework.AopContext;
+import cn.hutool.json.JSONUtil;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.annotation.PostConstruct;
 import javax.annotation.Resource;
-import java.time.LocalDateTime;
 import java.util.Collections;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * <p>
@@ -37,6 +30,7 @@ import java.util.concurrent.Executors;
  */
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+    private static final String ORDER_TOPIC = "voucher-order-topic";
     @Resource
     private SeckillVoucherServiceImpl seckillVoucherService;
     @Resource
@@ -45,7 +39,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private StringRedisTemplate stringRedisTemplate;
 
     @Resource
-    private RedissonClient redissonClient;
+    private KafkaTemplate<String, String> kafkaTemplate;
 
     // Lua脚本
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
@@ -55,34 +49,16 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         SECKILL_SCRIPT.setResultType(Long.class);
     }
 
-    // 存储订单的阻塞队列,参数为队列长度
-    private BlockingQueue<VoucherOrder> orderTasks = new ArrayBlockingQueue<>(1024 * 1024);
-    // 执行任务的线程池, ctrl+shift+U 转换大写
-    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
-    // 任务
-    private class VoucherOrderHandler implements Runnable {
-        @Override
-        public void run() {
-            while (true) { // 并不会对CPU造成负担,因为下面有take
-                // 从阻塞队列中获取订单信息，完成库存扣减和订单生成
-                try {
-                    // take() 获取和删除该队列的头部,如果需要则等待直到元素可用
-                    VoucherOrder voucherOrder = orderTasks.take();
-                    handleVoucherOrder(voucherOrder);
-                } catch (Exception e) {
-                    log.error("处理订单异常", e);
-                }
-            }
-        }
-    }
-
     // 完成库存扣减和订单生成
-    private void handleVoucherOrder(VoucherOrder voucherOrder) {
+    @KafkaListener(topics = ORDER_TOPIC, groupId = "voucher-order-group")
+    @Transactional
+    public void handleVoucherOrder(String msg) {
+        VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
         // 在Redis已经做了库存是否充足和一人一单的校验,能够到这里说明用户已经秒杀成功了,所以这里其实不需要加锁
         // 1.扣减库存
         boolean success = seckillVoucherService.update()
                 .setSql("stock = stock -1")
-                .eq("voucher_id", voucherOrder.getId())
+                .eq("voucher_id", voucherOrder.getVoucherId())
                 .gt("stock", 0)
                 .update();
         if(!success){
@@ -92,13 +68,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         // 2.创建订单
         save(voucherOrder);
-    }
-
-    // 当前类初始化完毕就立马执行该方法
-    @PostConstruct
-    private void init() {
-        // 执行线程任务
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
 
     @Override
@@ -125,7 +94,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         voucherOrder.setId(orderID);    // 订单ID
         voucherOrder.setUserId(userID); // 用户ID
         voucherOrder.setVoucherId(voucherID); // 优惠券ID
-        orderTasks.add(voucherOrder);
+        kafkaTemplate.send(ORDER_TOPIC, JSONUtil.toJsonStr(voucherOrder));
         return Result.ok(orderID);
     }
 
